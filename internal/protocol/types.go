@@ -1,8 +1,6 @@
 package protocol
 
-import (
-	"github.com/libp2p/go-libp2p/core/peer"
-)
+import "github.com/libp2p/go-libp2p/core/peer"
 
 const (
 	ProtocolID     = "/the-grid/1.0.0"
@@ -22,38 +20,38 @@ type InputPacket struct {
 }
 
 type StatePacket struct {
-	// Keys will be "HOST" and "CLIENT"
 	Players map[string]PlayerPosition `json:"players"`
 }
 
 type PlayerPosition struct {
 	X int    `json:"x"`
 	Y int    `json:"y"`
-	C string `json:"c"` // Character
+	C string `json:"c"`
 }
 
-// --- Internal Messaging ---
+// --- Discovery Data ---
 
+// DiscoveryPacket is used to broadcast presence on the DHT gossipsub topic
+type DiscoveryPacket struct {
+	RoomCode string   `json:"room_code"`
+	PeerID   string   `json:"peer_id"`
+	Addrs    []string `json:"addrs"`
+}
+
+// --- Internal Messaging & Events ---
+
+// NetMessage wraps the raw bytes received from the stream
 type NetMessage struct {
-	// FIX: We must ignore Sender in JSON, otherwise empty string fails validation on RX
 	Sender peer.ID `json:"-"`
 	Type   byte    `json:"type"`
 	Data   []byte  `json:"data"`
 }
 
-type StatusUpdate struct {
-	Key   string
-	Value string
-}
+// LogEvent is a simple string alias for UI logging
+type LogEvent string
 
-type DiscoveryPacket struct {
-	RoomCode string
-	PeerID   string
-	Addrs    []string
-}
-
-// Logic Helper
-func AmIHost(selfID, peerID peer.ID) bool {
-	// String comparison ensures deterministic authority
-	return selfID.String() < peerID.String()
+// StatusEvent is used to update UI indicators (like connectivity icons)
+type StatusEvent struct {
+	Key string
+	Val string
 }

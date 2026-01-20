@@ -1,26 +1,23 @@
 package main
 
 import (
-	"fmt"
-	"os"
-
+	"github.com/IgorBayerl/the-grid/internal/game"
 	"github.com/IgorBayerl/the-grid/internal/p2p"
 	"github.com/IgorBayerl/the-grid/internal/ui"
-
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
-	// 1. Initialize the "Serverless" Backend
-	node := p2p.NewNode()
+	// 1. Infrastructure
+	network := p2p.NewNode()
 
-	// 2. Initialize the UI with a reference to the backend
-	model := ui.NewModel(node)
+	// 2. Domain
+	engine := game.NewEngine(network)
 
-	// 3. Run the Program
+	// 3. Presentation
+	model := ui.NewModel(engine)
+
+	// 4. Run
 	p := tea.NewProgram(model, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
-	}
+	p.Run()
 }

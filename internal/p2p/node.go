@@ -23,6 +23,18 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+// NetworkNode defines the public interface
+type NetworkNode interface {
+	ID() peer.ID
+	GetRemotePeer() peer.ID
+	IsConnected() bool
+	Send(typeByte byte, payload interface{})
+	Events() <-chan interface{}
+	JoinLobby(code string)
+	StartStream(pid peer.ID)
+	Bootstrap()
+}
+
 type Node struct {
 	Ctx       context.Context
 	Host      host.Host
@@ -30,8 +42,7 @@ type Node struct {
 	PubSub    *pubsub.PubSub
 	Discovery *routing.RoutingDiscovery
 
-	MsgIn      chan protocol.NetMessage
-	StatusChan chan protocol.StatusUpdate
+	eventsOut chan interface{}
 
 	CurrentRoom string
 	DiscoveryTp *pubsub.Topic
@@ -53,10 +64,9 @@ func NewNode() *Node {
 	}
 
 	n := &Node{
-		Ctx:        context.Background(),
-		Host:       h,
-		MsgIn:      make(chan protocol.NetMessage, 100),
-		StatusChan: make(chan protocol.StatusUpdate, 100),
+		Ctx:       context.Background(),
+		Host:      h,
+		eventsOut: make(chan interface{}, 100),
 	}
 
 	h.SetStreamHandler(protocol.GameProtocol, n.handleStream)
@@ -64,101 +74,35 @@ func NewNode() *Node {
 	return n
 }
 
-func (n *Node) Log(format string, a ...interface{}) {
-	msg := fmt.Sprintf(format, a...)
-	select {
-	case n.StatusChan <- protocol.StatusUpdate{Key: "LOG", Value: msg}:
-	default:
-	}
+// --- Interface Implementation ---
+
+func (n *Node) ID() peer.ID {
+	return n.Host.ID()
 }
 
-// --- Game Logic ---
+func (n *Node) GetRemotePeer() peer.ID {
+	return n.RemotePeer
+}
 
-func (n *Node) StartGame() {
-	if n.RemotePeer == "" {
-		n.Log("Cannot Start: Waiting for Peer...")
+func (n *Node) IsConnected() bool {
+	n.streamLock.Lock()
+	defer n.streamLock.Unlock()
+	return n.GameStream != nil
+}
+
+func (n *Node) Events() <-chan interface{} {
+	return n.eventsOut
+}
+
+func (n *Node) Send(typeByte byte, payload interface{}) {
+	n.streamLock.Lock()
+	s := n.GameStream
+	n.streamLock.Unlock()
+
+	if s == nil {
 		return
 	}
 
-	n.Log("Dialing Game Stream to %s...", n.RemotePeer.ShortString())
-	s, err := n.Host.NewStream(n.Ctx, n.RemotePeer, protocol.GameProtocol)
-	if err != nil {
-		n.Log("Stream Failed: %s", err)
-		return
-	}
-
-	// Set synchronously
-	n.GameStream = s
-
-	// Start Heartbeat loop
-	go n.heartbeatLoop()
-
-	// Handle Incoming
-	go n.handleStream(s)
-}
-
-func (n *Node) heartbeatLoop() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-n.Ctx.Done():
-			return
-		case <-ticker.C:
-			if n.GameStream != nil {
-				// Send Heartbeat (Empty payload)
-				n.SendPacket(protocol.PacketHeartbeat, nil)
-			} else {
-				return // Stream closed
-			}
-		}
-	}
-}
-
-func (n *Node) handleStream(s network.Stream) {
-	n.RemotePeer = s.Conn().RemotePeer()
-	n.GameStream = s
-
-	n.Log("Connected to %s", n.RemotePeer.ShortString())
-	n.StatusChan <- protocol.StatusUpdate{Key: "GAME", Value: "START"}
-
-	// Start sending heartbeats if I was the receiver of the stream too
-	go n.heartbeatLoop()
-
-	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
-
-	for {
-		// Read until newline
-		str, err := rw.ReadString('\n')
-		if err != nil {
-			n.Log("Stream Closed: %v", err)
-			n.StatusChan <- protocol.StatusUpdate{Key: "GAME", Value: "STOP"}
-			s.Reset()
-			return
-		}
-
-		// Decode
-		var msg protocol.NetMessage
-		if err := json.Unmarshal([]byte(str), &msg); err != nil {
-			// This often happens if 'Sender' is malformed in JSON
-			n.Log("Bad Packet JSON: %v", err)
-			continue
-		}
-
-		// Important: We populate the Sender manually.
-		// We do NOT rely on the JSON field for ID.
-		msg.Sender = s.Conn().RemotePeer()
-		n.MsgIn <- msg
-	}
-}
-
-func (n *Node) SendPacket(typeByte byte, payload interface{}) {
-	if n.GameStream == nil {
-		return
-	}
-
-	// Payload might be nil for heartbeat
 	var data []byte
 	if payload != nil {
 		data, _ = json.Marshal(payload)
@@ -167,31 +111,107 @@ func (n *Node) SendPacket(typeByte byte, payload interface{}) {
 	msg := protocol.NetMessage{
 		Type: typeByte,
 		Data: data,
-		// Sender is purposely left blank/ignored by JSON
 	}
 
 	bytes, _ := json.Marshal(msg)
 
-	n.streamLock.Lock()
-	defer n.streamLock.Unlock()
-
-	// Append Newline to frame the message
-	_, err := n.GameStream.Write(append(bytes, '\n'))
+	// We append a newline so the other side can use ReadString('\n')
+	_, err := s.Write(append(bytes, '\n'))
 	if err != nil {
-		n.Log("Send Error: %s", err)
-		n.GameStream = nil
+		n.emitLog(fmt.Sprintf("Send Error: %s", err))
+		n.closeStream()
 	}
 }
 
-// --- Discovery & Bootstrap (Standard) ---
+// --- Internal Helpers ---
+
+func (n *Node) emitStatus(key, val string) {
+	select {
+	case n.eventsOut <- protocol.StatusEvent{Key: key, Val: val}:
+	default:
+	}
+}
+
+func (n *Node) emitLog(msg string) {
+	select {
+	case n.eventsOut <- protocol.LogEvent(msg):
+	default:
+	}
+}
+
+func (n *Node) closeStream() {
+	n.streamLock.Lock()
+	if n.GameStream != nil {
+		n.GameStream.Reset()
+		n.GameStream = nil
+	}
+	n.streamLock.Unlock()
+	n.emitStatus("GAME", "STOP")
+}
+
+// --- Connection Logic ---
+
+func (n *Node) StartStream(pid peer.ID) {
+	n.RemotePeer = pid
+	n.emitLog(fmt.Sprintf("Dialing Game Stream to %s...", pid.ShortString()))
+
+	s, err := n.Host.NewStream(n.Ctx, pid, protocol.GameProtocol)
+	if err != nil {
+		n.emitLog(fmt.Sprintf("Stream Failed: %s", err))
+		return
+	}
+
+	// CRITICAL FIX: Run handleStream in a goroutine to prevent freezing the UI
+	go n.handleStream(s)
+}
+
+func (n *Node) handleStream(s network.Stream) {
+	n.streamLock.Lock()
+	n.GameStream = s
+	n.RemotePeer = s.Conn().RemotePeer()
+	n.streamLock.Unlock()
+
+	n.emitLog(fmt.Sprintf("Connected to %s", n.RemotePeer.ShortString()))
+	n.emitStatus("GAME", "START")
+
+	// CRITICAL FIX: Use bufio.Reader instead of json.Decoder for robustness
+	reader := bufio.NewReader(s)
+
+	for {
+		// Read until newline
+		str, err := reader.ReadString('\n')
+		if err != nil {
+			n.emitLog(fmt.Sprintf("Stream Closed: %v", err))
+			n.closeStream()
+			return
+		}
+
+		if len(strings.TrimSpace(str)) == 0 {
+			continue
+		}
+
+		var msg protocol.NetMessage
+		if err := json.Unmarshal([]byte(str), &msg); err != nil {
+			n.emitLog(fmt.Sprintf("Bad Packet: %v", err))
+			continue
+		}
+
+		// Inject Sender ID
+		msg.Sender = s.Conn().RemotePeer()
+		n.eventsOut <- msg
+	}
+}
+
+// --- Discovery & Bootstrap ---
 
 func (n *Node) Bootstrap() {
-	n.StatusChan <- protocol.StatusUpdate{Key: "DHT", Value: "START"}
-	n.Log("Connecting to Public Swarm...")
-	n.ConnectToBootnodes()
+	n.emitStatus("DHT", "START")
+	n.emitLog("Connecting to Public Swarm...")
+	n.connectToBootnodes()
 
 	kademlia, err := dht.New(n.Ctx, n.Host)
 	if err != nil {
+		n.emitLog(fmt.Sprintf("DHT Error: %v", err))
 		return
 	}
 	n.DHT = kademlia
@@ -201,12 +221,14 @@ func (n *Node) Bootstrap() {
 
 	ps, err := pubsub.NewGossipSub(n.Ctx, n.Host)
 	if err != nil {
+		n.emitLog(fmt.Sprintf("PubSub Error: %v", err))
 		return
 	}
 	n.PubSub = ps
 
 	topic, err := n.PubSub.Join(protocol.DiscoveryTopic)
 	if err != nil {
+		n.emitLog(fmt.Sprintf("Join Topic Error: %v", err))
 		return
 	}
 	n.DiscoveryTp = topic
@@ -219,10 +241,10 @@ func (n *Node) Bootstrap() {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	n.StatusChan <- protocol.StatusUpdate{Key: "DHT", Value: "DONE"}
+	n.emitStatus("DHT", "DONE")
 }
 
-func (n *Node) ConnectToBootnodes() {
+func (n *Node) connectToBootnodes() {
 	var wg sync.WaitGroup
 	for _, addrStr := range dht.DefaultBootstrapPeers {
 		addr, err := multiaddr.NewMultiaddr(addrStr.String())
@@ -243,7 +265,7 @@ func (n *Node) ConnectToBootnodes() {
 
 func (n *Node) JoinLobby(code string) {
 	n.CurrentRoom = code
-	n.StatusChan <- protocol.StatusUpdate{Key: "RELAY", Value: "SEARCHING"}
+	n.emitStatus("RELAY", "SEARCHING")
 	go n.advertiseLoop()
 	dutil.Advertise(n.Ctx, n.Discovery, "grid-lobby-"+code)
 	go n.findPeersDHT("grid-lobby-" + code)
@@ -258,7 +280,7 @@ func (n *Node) advertiseLoop() {
 			return
 		case <-ticker.C:
 			count := len(n.Host.Network().Peers())
-			n.StatusChan <- protocol.StatusUpdate{Key: "SWARM", Value: fmt.Sprintf("%d", count)}
+			n.emitStatus("SWARM", fmt.Sprintf("%d", count))
 
 			addrs := []string{}
 			for _, a := range n.Host.Addrs() {
@@ -338,14 +360,14 @@ func (n *Node) connectToPeer(id peer.ID, addrs []multiaddr.Multiaddr) {
 	}
 
 	n.RemotePeer = id
-	n.StatusChan <- protocol.StatusUpdate{Key: "PEERS", Value: id.String()}
+	n.emitStatus("PEERS", id.String())
 
 	targetInfo := peer.AddrInfo{ID: id, Addrs: addrs}
 	ctx, cancel := context.WithTimeout(n.Ctx, 10*time.Second)
 	defer cancel()
 
 	n.Host.Connect(ctx, targetInfo)
-	n.StatusChan <- protocol.StatusUpdate{Key: "RELAY", Value: "CONNECTED"}
+	n.emitStatus("RELAY", "CONNECTED")
 	go n.monitorConnection(id)
 }
 
@@ -363,7 +385,7 @@ func (n *Node) monitorConnection(pid peer.ID) {
 			if len(conns) == 0 {
 				return
 			}
-			n.StatusChan <- protocol.StatusUpdate{Key: "PEERS", Value: pid.String()}
+			n.emitStatus("PEERS", pid.String())
 
 			for _, c := range conns {
 				addr := c.RemoteMultiaddr().String()
@@ -371,8 +393,8 @@ func (n *Node) monitorConnection(pid peer.ID) {
 
 				if !isRelay {
 					if !loggedDirect {
-						n.Log("DIRECT LINK ESTABLISHED! (%s)", addr)
-						n.StatusChan <- protocol.StatusUpdate{Key: "HOLEPUNCH", Value: "DIRECT"}
+						n.emitLog(fmt.Sprintf("DIRECT LINK ESTABLISHED! (%s)", addr))
+						n.emitStatus("HOLEPUNCH", "DIRECT")
 						loggedDirect = true
 					}
 					return

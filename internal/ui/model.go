@@ -1,11 +1,11 @@
 package ui
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/IgorBayerl/the-grid/internal/game"
 	"github.com/IgorBayerl/the-grid/internal/p2p"
 	"github.com/IgorBayerl/the-grid/internal/protocol"
 
@@ -28,9 +28,10 @@ const (
 )
 
 type Model struct {
-	Node   *p2p.Node
+	Game   *game.Engine
 	Screen Screen
 
+	// UI Local State
 	LobbyCodeInput string
 	BootProgress   float64
 	SwarmPeers     string
@@ -39,41 +40,36 @@ type Model struct {
 	DHTReady    bool
 	FoundPeerID string
 	IsDirect    bool
-
-	AmIHost       bool
-	LastHeartbeat time.Time
-	PlayerH       protocol.PlayerPosition
-	PlayerC       protocol.PlayerPosition
 }
 
-func NewModel(node *p2p.Node) Model {
+func NewModel(g *game.Engine) Model {
 	return Model{
-		Node:       node,
+		Game:       g,
 		Screen:     ScreenBoot,
 		DebugLog:   []string{"Initializing UI..."},
 		SwarmPeers: "0",
-		PlayerH:    protocol.PlayerPosition{X: 5, Y: 5, C: "@"},
-		PlayerC:    protocol.PlayerPosition{X: 35, Y: 10, C: "X"},
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		tickBoot(),
-		waitForStatus(m.Node),
-		waitForPacket(m.Node),
+		waitForNetworkEvent(m.Game.Net),
+		tickGame(),
 	)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
+	// --- 1. User Input Handling ---
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
 		}
 
-		if m.Screen == ScreenLobby {
+		switch m.Screen {
+		case ScreenLobby:
 			switch msg.Type {
 			case tea.KeyBackspace, tea.KeyDelete:
 				if len(m.LobbyCodeInput) > 0 {
@@ -82,7 +78,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyEnter:
 				if len(m.LobbyCodeInput) >= 3 {
 					m.Screen = ScreenAirlock
-					m.Node.JoinLobby(m.LobbyCodeInput)
+					m.Game.Net.JoinLobby(m.LobbyCodeInput)
 					return m, nil
 				}
 			case tea.KeyRunes:
@@ -90,133 +86,86 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.LobbyCodeInput += msg.String()
 				}
 			}
-		} else if m.Screen == ScreenAirlock {
+
+		case ScreenAirlock:
 			if msg.Type == tea.KeyEnter && m.IsDirect {
-				// --- Role Calculation ---
-				amIHost := protocol.AmIHost(m.Node.Host.ID(), m.Node.RemotePeer)
-				if amIHost {
-					m.DebugLog = append(m.DebugLog, "I am Host. Dialing...")
-					m.Node.StartGame()
-				} else {
-					m.DebugLog = append(m.DebugLog, "I am Client. Waiting for Host...")
-				}
-			}
-		} else if m.Screen == ScreenGame {
-			dx, dy := 0, 0
-			switch msg.String() {
-			case "up":
-				dy = -1
-			case "down":
-				dy = 1
-			case "left":
-				dx = -1
-			case "right":
-				dx = 1
+				status := m.Game.UserInitiateStart()
+				m.DebugLog = append(m.DebugLog, status)
 			}
 
-			if dx != 0 || dy != 0 {
-				if m.AmIHost {
-					m.PlayerH.X += dx
-					m.PlayerH.Y += dy
-					m.broadcastState()
-					m.DebugLog = append(m.DebugLog, "Host Moved -> Broadcast")
-				} else {
-					m.Node.SendPacket(protocol.PacketInput, protocol.InputPacket{DX: dx, DY: dy})
-					m.DebugLog = append(m.DebugLog, "Client Input -> Sent")
-				}
+		case ScreenGame:
+			switch msg.String() {
+			case "up":
+				m.Game.MoveLocal(0, -1)
+			case "down":
+				m.Game.MoveLocal(0, 1)
+			case "left":
+				m.Game.MoveLocal(-1, 0)
+			case "right":
+				m.Game.MoveLocal(1, 0)
 			}
 		}
 
+	// --- 2. Animations ---
 	case TickBootMsg:
 		if m.BootProgress < 1.0 {
 			m.BootProgress += 0.05
 			return m, tickBoot()
 		}
-		go m.Node.Bootstrap()
+		go m.Game.Net.Bootstrap()
 
-	case protocol.StatusUpdate:
+	// --- 3. Network Events ---
+	case protocol.StatusEvent:
 		switch msg.Key {
-		case "LOG":
-			m.DebugLog = append(m.DebugLog, fmt.Sprintf("> %s", msg.Value))
-			if len(m.DebugLog) > 8 {
-				m.DebugLog = m.DebugLog[1:]
-			}
 		case "SWARM":
-			m.SwarmPeers = msg.Value
+			m.SwarmPeers = msg.Val
 		case "DHT":
-			if msg.Value == "DONE" {
+			if msg.Val == "DONE" {
 				m.DHTReady = true
 				m.Screen = ScreenLobby
 			}
 		case "PEERS":
-			m.FoundPeerID = msg.Value
+			m.FoundPeerID = msg.Val
 		case "HOLEPUNCH":
 			m.IsDirect = true
-
 		case "GAME":
-			if msg.Value == "START" {
+			switch msg.Val {
+			case "START":
 				m.Screen = ScreenGame
-				m.AmIHost = protocol.AmIHost(m.Node.Host.ID(), m.Node.RemotePeer)
-				m.DebugLog = append(m.DebugLog, fmt.Sprintf("GAME STARTED. Role: Host=%v", m.AmIHost))
+				m.Game.OnGameStarted()
+				m.DebugLog = append(m.DebugLog, fmt.Sprintf("GAME STARTED. Host=%v", m.Game.AmIHost))
 
-				if m.AmIHost {
-					m.broadcastState()
-				}
-				return m, tea.ClearScreen
-			} else if msg.Value == "STOP" {
+				// FIX: Must restart the network listener, otherwise we stop receiving packets!
+				return m, tea.Batch(tea.ClearScreen, waitForNetworkEvent(m.Game.Net))
+
+			case "STOP":
 				m.Screen = ScreenAirlock
 				m.DebugLog = append(m.DebugLog, "PEER DISCONNECTED")
-				return m, tea.ClearScreen
+				m.Game.IsRunning = false
+
+				// FIX: Restart listener here too
+				return m, tea.Batch(tea.ClearScreen, waitForNetworkEvent(m.Game.Net))
 			}
 		}
-		return m, waitForStatus(m.Node)
+		return m, waitForNetworkEvent(m.Game.Net)
+
+	case protocol.LogEvent:
+		m.DebugLog = append(m.DebugLog, fmt.Sprintf("> %s", string(msg)))
+		if len(m.DebugLog) > 8 {
+			m.DebugLog = m.DebugLog[1:]
+		}
+		return m, waitForNetworkEvent(m.Game.Net)
 
 	case protocol.NetMessage:
-		handled := false
+		m.Game.ProcessPacket(msg)
+		return m, waitForNetworkEvent(m.Game.Net)
 
-		// Heartbeats are common to both roles
-		if msg.Type == protocol.PacketHeartbeat {
-			m.LastHeartbeat = time.Now()
-			handled = true
-		}
-
-		if m.AmIHost && msg.Type == protocol.PacketInput {
-			var input protocol.InputPacket
-			if err := json.Unmarshal(msg.Data, &input); err == nil {
-				m.PlayerC.X += input.DX
-				m.PlayerC.Y += input.DY
-				m.broadcastState()
-				m.DebugLog = append(m.DebugLog, "Rx Input -> Update")
-				handled = true
-			}
-		} else if !m.AmIHost && msg.Type == protocol.PacketState {
-			var state protocol.StatePacket
-			if err := json.Unmarshal(msg.Data, &state); err == nil {
-				m.PlayerH = state.Players["HOST"]
-				m.PlayerC = state.Players["CLIENT"]
-				handled = true
-			}
-		}
-
-		if !handled {
-			// This catches the silent failures (e.g. Host receiving StatePacket, Client receiving Input, or parsing errors)
-			m.DebugLog = append(m.DebugLog, fmt.Sprintf("Ignored Packet: T=%d Host=%v", msg.Type, m.AmIHost))
-		}
-
-		return m, waitForPacket(m.Node)
+	case TickGameMsg:
+		m.Game.Tick()
+		return m, tickGame()
 	}
 
 	return m, nil
-}
-
-func (m *Model) broadcastState() {
-	state := protocol.StatePacket{
-		Players: map[string]protocol.PlayerPosition{
-			"HOST":   m.PlayerH,
-			"CLIENT": m.PlayerC,
-		},
-	}
-	m.Node.SendPacket(protocol.PacketState, state)
 }
 
 func (m Model) View() string {
@@ -243,6 +192,8 @@ func (m Model) View() string {
 	return ""
 }
 
+// --- Render Helpers ---
+
 func renderGame(m Model) string {
 	width, height := 40, 15
 	grid := make([][]string, height)
@@ -259,18 +210,18 @@ func renderGame(m Model) string {
 		}
 	}
 
-	draw(m.PlayerH, styleHost)
-	draw(m.PlayerC, styleClient)
+	draw(m.Game.PlayerH, styleHost)
+	draw(m.Game.PlayerC, styleClient)
 
 	var s strings.Builder
 	role := "CLIENT (You are Red X)"
-	if m.AmIHost {
+	if m.Game.AmIHost {
 		role = "HOST (You are Green @)"
 	}
 
 	// Heartbeat Visual
-	hb := "DEAD"
-	diff := time.Since(m.LastHeartbeat)
+	var hb string
+	diff := time.Since(m.Game.LastHeartbeat)
 	if diff < 2*time.Second {
 		hb = styleHeart.Render("❤️  " + diff.Round(time.Millisecond).String())
 	} else {
@@ -317,14 +268,17 @@ func renderAirlock(m Model) string {
 	if m.IsDirect {
 		instr = "\n  [ PRESS ENTER TO START GAME ]\n"
 	}
-	// Also show role hint
-	amIHost := protocol.AmIHost(m.Node.Host.ID(), m.Node.RemotePeer)
-	roleHint := "(You will be CLIENT)"
-	if amIHost {
-		roleHint = "(You will be HOST)"
-	}
-	if m.Node.RemotePeer == "" {
-		roleHint = "(Searching...)"
+
+	// Role hint logic
+	roleHint := "(Searching...)"
+	if m.Game.Net.GetRemotePeer() != "" {
+		myID := m.Game.Net.ID().String()
+		remoteID := m.Game.Net.GetRemotePeer().String()
+		if myID < remoteID {
+			roleHint = "(You will be HOST)"
+		} else {
+			roleHint = "(You will be CLIENT)"
+		}
 	}
 
 	symPubSub := "[ .. ]"
@@ -351,6 +305,12 @@ func renderAirlock(m Model) string {
 		peerDisp = m.FoundPeerID[:6] + "..."
 	}
 
+	// Safe type assertion for display purposes only
+	room := "???"
+	if n, ok := m.Game.Net.(*p2p.Node); ok {
+		room = n.CurrentRoom
+	}
+
 	return fmt.Sprintf(`
   🔒 ACCESSING ROOM: %s
 	
@@ -363,13 +323,22 @@ func renderAirlock(m Model) string {
 	
   STATUS: %s
   %s %s
-	`, m.Node.CurrentRoom, peerDisp, symPubSub, symRelay, symHolePunch, status, roleHint, instr)
+	`, room, peerDisp, symPubSub, symRelay, symHolePunch, status, roleHint, instr)
 }
 
 type TickBootMsg time.Time
+type TickGameMsg time.Time
 
 func tickBoot() tea.Cmd {
 	return tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg { return TickBootMsg(t) })
 }
-func waitForStatus(n *p2p.Node) tea.Cmd { return func() tea.Msg { return <-n.StatusChan } }
-func waitForPacket(n *p2p.Node) tea.Cmd { return func() tea.Msg { return <-n.MsgIn } }
+
+func tickGame() tea.Cmd {
+	return tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg { return TickGameMsg(t) })
+}
+
+func waitForNetworkEvent(n interface{ Events() <-chan interface{} }) tea.Cmd {
+	return func() tea.Msg {
+		return <-n.Events()
+	}
+}
