@@ -219,16 +219,30 @@ func renderGame(m Model) string {
 		role = "HOST (You are Green @)"
 	}
 
-	// Heartbeat Visual
+	// --- NEW PING VISUALIZATION ---
 	var hb string
-	diff := time.Since(m.Game.LastHeartbeat)
-	if diff < 2*time.Second {
-		hb = styleHeart.Render("❤️  " + diff.Round(time.Millisecond).String())
-	} else {
-		hb = styleLog.Render("💔 " + diff.Round(time.Second).String())
-	}
 
-	s.WriteString(fmt.Sprintf("\n  THE GRID | %s | Ping: %s\n", role, hb))
+	// Check if the connection is actually stale (no packets for > 2 seconds)
+	timeSinceLastPacket := time.Since(m.Game.LastPacketTime)
+
+	if timeSinceLastPacket > 2*time.Second {
+		// Connection Lost
+		hb = styleLog.Render(fmt.Sprintf("💔 DISCONNECTED (%s)", timeSinceLastPacket.Round(time.Second)))
+	} else {
+		// Healthy Connection: Show smoothed Latency
+		latencyMs := m.Game.Latency.Milliseconds()
+
+		// Color coding based on lag
+		pingStyle := styleHost // Green
+		if latencyMs > 100 {
+			pingStyle = styleClient // Red
+		}
+
+		hb = pingStyle.Render(fmt.Sprintf("📶 %d ms", latencyMs))
+	}
+	// ------------------------------
+
+	s.WriteString(fmt.Sprintf("\n  THE GRID | %s | %s\n", role, hb))
 	s.WriteString("  ┌" + strings.Repeat("─", width*2) + "┐\n")
 	for _, row := range grid {
 		s.WriteString("  │")

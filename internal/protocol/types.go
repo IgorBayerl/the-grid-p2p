@@ -7,9 +7,10 @@ const (
 	DiscoveryTopic = "the-grid-discovery-v1"
 	GameProtocol   = "/the-grid/game/1.0.0"
 
-	PacketInput     = 0x01
-	PacketState     = 0x02
-	PacketHeartbeat = 0x99
+	PacketInput = 0x01
+	PacketState = 0x02
+	PacketPing  = 0x10
+	PacketPong  = 0x11
 )
 
 // --- Game Data ---
@@ -29,9 +30,14 @@ type PlayerPosition struct {
 	C string `json:"c"`
 }
 
-// --- Discovery Data ---
+// --- Ping Data ---
 
-// DiscoveryPacket is used to broadcast presence on the DHT gossipsub topic
+type PingPayload struct {
+	OriginTime int64 `json:"t"` // UnixNano timestamp
+}
+
+// --- Discovery Data (Crucial for P2P) ---
+
 type DiscoveryPacket struct {
 	RoomCode string   `json:"room_code"`
 	PeerID   string   `json:"peer_id"`
@@ -40,17 +46,14 @@ type DiscoveryPacket struct {
 
 // --- Internal Messaging & Events ---
 
-// NetMessage wraps the raw bytes received from the stream
 type NetMessage struct {
 	Sender peer.ID `json:"-"`
 	Type   byte    `json:"type"`
 	Data   []byte  `json:"data"`
 }
 
-// LogEvent is a simple string alias for UI logging
 type LogEvent string
 
-// StatusEvent is used to update UI indicators (like connectivity icons)
 type StatusEvent struct {
 	Key string
 	Val string

@@ -12,11 +12,14 @@ type Engine struct {
 	Net p2p.NetworkNode
 
 	// Game State
-	IsRunning     bool
-	AmIHost       bool
-	PlayerH       protocol.PlayerPosition
-	PlayerC       protocol.PlayerPosition
-	LastHeartbeat time.Time
+	IsRunning bool
+	AmIHost   bool
+	PlayerH   protocol.PlayerPosition
+	PlayerC   protocol.PlayerPosition
+
+	// Ping / Latency Logic
+	Latency        time.Duration // The smoothed Round Trip Time
+	LastPacketTime time.Time     // Used to detect disconnects
 }
 
 func NewEngine(net p2p.NetworkNode) *Engine {
@@ -27,12 +30,12 @@ func NewEngine(net p2p.NetworkNode) *Engine {
 	}
 }
 
-// Tick is called by the UI loop every X milliseconds
+// Tick is called by the UI loop every 100ms
 func (g *Engine) Tick() {
-	// Send heartbeat regardless of Role (Host/Client)
-	// This ensures both sides can calculate Ping.
 	if g.IsRunning {
-		g.Net.Send(protocol.PacketHeartbeat, nil)
+		// Send a PING with the current time
+		payload := protocol.PingPayload{OriginTime: time.Now().UnixNano()}
+		g.Net.Send(protocol.PacketPing, payload)
 	}
 }
 
@@ -43,37 +46,50 @@ func (g *Engine) MoveLocal(dx, dy int) {
 	}
 
 	if g.AmIHost {
-		// Host moves immediately, then broadcasts
 		g.PlayerH.X += dx
 		g.PlayerH.Y += dy
 		g.broadcastState()
 	} else {
-		// Client sends request to Host
 		g.Net.Send(protocol.PacketInput, protocol.InputPacket{DX: dx, DY: dy})
 	}
 }
 
 // ProcessPacket handles incoming network data
 func (g *Engine) ProcessPacket(msg protocol.NetMessage) {
-	// Heartbeat check (common to both)
-	if msg.Type == protocol.PacketHeartbeat {
-		g.LastHeartbeat = time.Now()
-		return
-	}
+	// Always update LastPacketTime so we know the connection is alive
+	g.LastPacketTime = time.Now()
 
-	if g.AmIHost {
-		// HOST LOGIC: Process inputs from client
-		if msg.Type == protocol.PacketInput {
+	switch msg.Type {
+
+	// Case 1: Received a Ping -> Immediately send back a Pong with the SAME timestamp
+	case protocol.PacketPing:
+		var p protocol.PingPayload
+		if err := json.Unmarshal(msg.Data, &p); err == nil {
+			g.Net.Send(protocol.PacketPong, p)
+		}
+
+	// Case 2: Received a Pong -> Calculate RTT
+	case protocol.PacketPong:
+		var p protocol.PingPayload
+		if err := json.Unmarshal(msg.Data, &p); err == nil {
+			origin := time.Unix(0, p.OriginTime)
+			rtt := time.Since(origin)
+			g.updateLatency(rtt)
+		}
+
+	// Game Logic
+	case protocol.PacketInput:
+		if g.AmIHost {
 			var input protocol.InputPacket
 			if err := json.Unmarshal(msg.Data, &input); err == nil {
 				g.PlayerC.X += input.DX
 				g.PlayerC.Y += input.DY
-				g.broadcastState() // Authoritative sync
+				g.broadcastState()
 			}
 		}
-	} else {
-		// CLIENT LOGIC: Update world based on Host
-		if msg.Type == protocol.PacketState {
+
+	case protocol.PacketState:
+		if !g.AmIHost {
 			var state protocol.StatePacket
 			if err := json.Unmarshal(msg.Data, &state); err == nil {
 				g.PlayerH = state.Players["HOST"]
@@ -83,37 +99,39 @@ func (g *Engine) ProcessPacket(msg protocol.NetMessage) {
 	}
 }
 
+// Helper to smooth the Ping numbers so they don't jump around
+func (g *Engine) updateLatency(newRtt time.Duration) {
+	if g.Latency == 0 {
+		g.Latency = newRtt
+		return
+	}
+	// Simple Exponential Moving Average (Alpha = 0.2)
+	// Keeps it stable but responsive
+	g.Latency = time.Duration(float64(g.Latency)*0.8 + float64(newRtt)*0.2)
+}
+
 // --- Session Management ---
 
-// UserInitiateStart is called when the user presses Enter in the UI
 func (g *Engine) UserInitiateStart() string {
 	remote := g.Net.GetRemotePeer()
 	if remote == "" {
 		return "No peer connected."
 	}
-
-	// Calculate roles immediately
 	myID := g.Net.ID().String()
 	remoteID := remote.String()
 	g.AmIHost = myID < remoteID
 
 	if g.AmIHost {
-		// I am Host: I must open the stream.
-		// The UI will switch only when the stream event confirms success.
 		g.Net.StartStream(g.Net.GetRemotePeer())
 		return "Dialing..."
 	} else {
-		// I am Client: I must wait.
 		return "Waiting for Host to start..."
 	}
 }
 
-// OnGameStarted is called when the Network Layer confirms the stream is open
 func (g *Engine) OnGameStarted() {
 	g.IsRunning = true
-	g.LastHeartbeat = time.Now()
-
-	// Re-confirm roles
+	g.LastPacketTime = time.Now() // Reset timer
 	myID := g.Net.ID().String()
 	remoteID := g.Net.GetRemotePeer().String()
 	g.AmIHost = myID < remoteID

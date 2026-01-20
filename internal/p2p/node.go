@@ -14,7 +14,6 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -39,13 +38,15 @@ type Node struct {
 	Ctx       context.Context
 	Host      host.Host
 	DHT       *dht.IpfsDHT
-	PubSub    *pubsub.PubSub
 	Discovery *routing.RoutingDiscovery
+
+	// --- STRATEGY B: PUBSUB (Variables) ---
+	// PubSub      *pubsub.PubSub
+	// DiscoveryTp *pubsub.Topic
 
 	eventsOut chan interface{}
 
 	CurrentRoom string
-	DiscoveryTp *pubsub.Topic
 
 	GameStream network.Stream
 	RemotePeer peer.ID
@@ -54,6 +55,7 @@ type Node struct {
 }
 
 func NewNode() *Node {
+	// 1. Configure the Host to support NAT Traversal
 	h, err := libp2p.New(
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.EnableNATService(),
@@ -114,8 +116,6 @@ func (n *Node) Send(typeByte byte, payload interface{}) {
 	}
 
 	bytes, _ := json.Marshal(msg)
-
-	// We append a newline so the other side can use ReadString('\n')
 	_, err := s.Write(append(bytes, '\n'))
 	if err != nil {
 		n.emitLog(fmt.Sprintf("Send Error: %s", err))
@@ -149,19 +149,19 @@ func (n *Node) closeStream() {
 	n.emitStatus("GAME", "STOP")
 }
 
-// --- Connection Logic ---
+// --- Connection Logic (The "Airlock") ---
 
 func (n *Node) StartStream(pid peer.ID) {
 	n.RemotePeer = pid
 	n.emitLog(fmt.Sprintf("Dialing Game Stream to %s...", pid.ShortString()))
 
+	// This is the direct dial. If NAT traversal works, this succeeds.
 	s, err := n.Host.NewStream(n.Ctx, pid, protocol.GameProtocol)
 	if err != nil {
 		n.emitLog(fmt.Sprintf("Stream Failed: %s", err))
 		return
 	}
 
-	// CRITICAL FIX: Run handleStream in a goroutine to prevent freezing the UI
 	go n.handleStream(s)
 }
 
@@ -174,11 +174,9 @@ func (n *Node) handleStream(s network.Stream) {
 	n.emitLog(fmt.Sprintf("Connected to %s", n.RemotePeer.ShortString()))
 	n.emitStatus("GAME", "START")
 
-	// CRITICAL FIX: Use bufio.Reader instead of json.Decoder for robustness
 	reader := bufio.NewReader(s)
 
 	for {
-		// Read until newline
 		str, err := reader.ReadString('\n')
 		if err != nil {
 			n.emitLog(fmt.Sprintf("Stream Closed: %v", err))
@@ -196,82 +194,144 @@ func (n *Node) handleStream(s network.Stream) {
 			continue
 		}
 
-		// Inject Sender ID
 		msg.Sender = s.Conn().RemotePeer()
 		n.eventsOut <- msg
 	}
 }
 
-// --- Discovery & Bootstrap ---
+// ============================================================================
+//   DISCOVERY & BOOTSTRAP
+// ============================================================================
 
 func (n *Node) Bootstrap() {
 	n.emitStatus("DHT", "START")
 	n.emitLog("Connecting to Public Swarm...")
+
+	// 1. Connect to Public Bootnodes (Gateway to the IPFS network)
 	n.connectToBootnodes()
 
+	// 2. Initialize DHT (Distributed Hash Table)
+	//    This is needed for Strategy A.
 	kademlia, err := dht.New(n.Ctx, n.Host)
 	if err != nil {
 		n.emitLog(fmt.Sprintf("DHT Error: %v", err))
 		return
 	}
 	n.DHT = kademlia
-	kademlia.Bootstrap(n.Ctx)
+
+	//    Make ourselves a server so others can query us
+	if err = kademlia.Bootstrap(n.Ctx); err != nil {
+		n.emitLog(fmt.Sprintf("DHT Bootstrap Error: %v", err))
+	}
 
 	n.Discovery = routing.NewRoutingDiscovery(kademlia)
 
-	ps, err := pubsub.NewGossipSub(n.Ctx, n.Host)
-	if err != nil {
-		n.emitLog(fmt.Sprintf("PubSub Error: %v", err))
-		return
-	}
-	n.PubSub = ps
-
-	topic, err := n.PubSub.Join(protocol.DiscoveryTopic)
-	if err != nil {
-		n.emitLog(fmt.Sprintf("Join Topic Error: %v", err))
-		return
-	}
-	n.DiscoveryTp = topic
-
-	go n.handleDiscoveryEvents(topic)
-
-	for i := 0; i < 30; i++ {
-		if len(n.Host.Network().Peers()) > 0 {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	n.emitStatus("DHT", "DONE")
-}
-
-func (n *Node) connectToBootnodes() {
-	var wg sync.WaitGroup
-	for _, addrStr := range dht.DefaultBootstrapPeers {
-		addr, err := multiaddr.NewMultiaddr(addrStr.String())
+	// --- STRATEGY B: PUBSUB (DISABLED) ---
+	/*
+		ps, err := pubsub.NewGossipSub(n.Ctx, n.Host)
 		if err != nil {
-			continue
+			n.emitLog(fmt.Sprintf("PubSub Error: %v", err))
+			return
 		}
-		peerinfo, _ := peer.AddrInfoFromP2pAddr(addr)
-		wg.Add(1)
-		go func(pi *peer.AddrInfo) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(n.Ctx, 5*time.Second)
-			defer cancel()
-			n.Host.Connect(ctx, *pi)
-		}(peerinfo)
-	}
-	wg.Wait()
+		n.PubSub = ps
+
+		topic, err := n.PubSub.Join(protocol.DiscoveryTopic)
+		if err != nil {
+			n.emitLog(fmt.Sprintf("Join Topic Error: %v", err))
+			return
+		}
+		n.DiscoveryTp = topic
+
+		// Start listening for shouted messages
+		go n.handleStrategyB_PubSub(topic)
+	*/
+
+	// Start a UI reporter loop just to update peer count
+	go n.reportSwarmSize()
+
+	// Wait until we have some connections before saying we are ready
+	n.waitForSwarm()
+	n.emitStatus("DHT", "DONE")
 }
 
 func (n *Node) JoinLobby(code string) {
 	n.CurrentRoom = code
 	n.emitStatus("RELAY", "SEARCHING")
-	go n.advertiseLoop()
+
+	// =========================================================
+	// STRATEGY A: DHT (The Phonebook) - ACTIVE
+	// =========================================================
+	n.emitLog("Strategy: Using DHT (High Reliability, Slow Discovery)")
+
+	// 1. Advertise: Write our name in the phonebook under "grid-lobby-{code}"
+	//    This runs in the background and republishes every few hours.
 	dutil.Advertise(n.Ctx, n.Discovery, "grid-lobby-"+code)
-	go n.findPeersDHT("grid-lobby-" + code)
+
+	// 2. Find: Periodically check the phonebook for other names
+	go n.strategyA_FindPeersDHT("grid-lobby-" + code)
+
+	// =========================================================
+	// STRATEGY B: PubSub (The Shout) - DISABLED
+	// =========================================================
+	// n.emitLog("Strategy: PubSub Disabled")
+	// go n.strategyB_AdvertiseLoop()
 }
 
-func (n *Node) advertiseLoop() {
+// ============================================================================
+//   STRATEGY A: DHT LOGIC (ACTIVE)
+//   Concept: We ask the global network "Who provides 'grid-lobby-123'?"
+//   Pros: Works even if peers join minutes apart. Persistent.
+//   Cons: Slow. Provider records take time to propagate through the network.
+// ============================================================================
+
+func (n *Node) strategyA_FindPeersDHT(topic string) {
+	// Poll more frequently for university demo purposes (every 2 seconds)
+	// In production, you wouldn't spam the DHT this hard.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	n.emitLog("DHT: Querying network for peers...")
+
+	for {
+		select {
+		case <-n.Ctx.Done():
+			return
+		case <-ticker.C:
+			// FindPeers asks the DHT for addresses providing the key 'topic'
+			peerChan, err := n.Discovery.FindPeers(n.Ctx, topic)
+			if err != nil {
+				n.emitLog(fmt.Sprintf("DHT Find Error: %v", err))
+				continue
+			}
+
+			found := false
+			for p := range peerChan {
+				if p.ID == n.Host.ID() {
+					continue // Don't connect to self
+				}
+
+				found = true
+				// We found a peer in the phonebook! Try to call them.
+				n.connectToPeer(p.ID, p.Addrs)
+			}
+
+			if !found {
+				// Optional: Log that we are still looking
+				// n.emitLog("DHT: No peers found yet...")
+			}
+		}
+	}
+}
+
+// ============================================================================
+//   STRATEGY B: PUBSUB LOGIC (DISABLED)
+//   Concept: We shout our details to everyone subscribed to "the-grid-discovery"
+//   Pros: Instantaneous if both are online.
+//   Cons: If you shout before I listen, I miss it forever.
+// ============================================================================
+
+/*
+func (n *Node) strategyB_AdvertiseLoop() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -279,9 +339,7 @@ func (n *Node) advertiseLoop() {
 		case <-n.Ctx.Done():
 			return
 		case <-ticker.C:
-			count := len(n.Host.Network().Peers())
-			n.emitStatus("SWARM", fmt.Sprintf("%d", count))
-
+			// Create a packet with our details
 			addrs := []string{}
 			for _, a := range n.Host.Addrs() {
 				addrs = append(addrs, a.String())
@@ -290,6 +348,8 @@ func (n *Node) advertiseLoop() {
 				RoomCode: n.CurrentRoom, PeerID: n.Host.ID().String(), Addrs: addrs,
 			}
 			data, _ := json.Marshal(packet)
+
+			// Publish to the GossipSub topic
 			if n.DiscoveryTp != nil {
 				n.DiscoveryTp.Publish(n.Ctx, data)
 			}
@@ -297,29 +357,7 @@ func (n *Node) advertiseLoop() {
 	}
 }
 
-func (n *Node) findPeersDHT(topic string) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-n.Ctx.Done():
-			return
-		case <-ticker.C:
-			peerChan, err := n.Discovery.FindPeers(n.Ctx, topic)
-			if err != nil {
-				continue
-			}
-			for p := range peerChan {
-				if p.ID == n.Host.ID() {
-					continue
-				}
-				n.connectToPeer(p.ID, p.Addrs)
-			}
-		}
-	}
-}
-
-func (n *Node) handleDiscoveryEvents(topic *pubsub.Topic) {
+func (n *Node) handleStrategyB_PubSub(topic *pubsub.Topic) {
 	sub, err := topic.Subscribe()
 	if err != nil {
 		return
@@ -338,7 +376,11 @@ func (n *Node) handleDiscoveryEvents(topic *pubsub.Topic) {
 			continue
 		}
 
+		// FILTER: Only connect if they are in the same Room Code
 		if packet.RoomCode == n.CurrentRoom {
+			id, _ := peer.Decode(packet.PeerID)
+
+			// Reconstruct Multiaddrs
 			var mas []multiaddr.Multiaddr
 			for _, a := range packet.Addrs {
 				ma, err := multiaddr.NewMultiaddr(a)
@@ -346,13 +388,19 @@ func (n *Node) handleDiscoveryEvents(topic *pubsub.Topic) {
 					mas = append(mas, ma)
 				}
 			}
-			id, _ := peer.Decode(packet.PeerID)
+
 			n.connectToPeer(id, mas)
 		}
 	}
 }
+*/
+
+// ============================================================================
+//   COMMON HELPERS
+// ============================================================================
 
 func (n *Node) connectToPeer(id peer.ID, addrs []multiaddr.Multiaddr) {
+	// If already connected, just monitor the quality (Direct vs Relay)
 	if n.Host.Network().Connectedness(id) == network.Connected {
 		n.RemotePeer = id
 		go n.monitorConnection(id)
@@ -361,12 +409,19 @@ func (n *Node) connectToPeer(id peer.ID, addrs []multiaddr.Multiaddr) {
 
 	n.RemotePeer = id
 	n.emitStatus("PEERS", id.String())
+	n.emitLog("Found Peer via Discovery! Connecting...")
 
 	targetInfo := peer.AddrInfo{ID: id, Addrs: addrs}
 	ctx, cancel := context.WithTimeout(n.Ctx, 10*time.Second)
 	defer cancel()
 
-	n.Host.Connect(ctx, targetInfo)
+	// Attempt the Libp2p connection handshake
+	err := n.Host.Connect(ctx, targetInfo)
+	if err != nil {
+		n.emitLog(fmt.Sprintf("Connection Failed: %s", err))
+		return
+	}
+
 	n.emitStatus("RELAY", "CONNECTED")
 	go n.monitorConnection(id)
 }
@@ -389,11 +444,12 @@ func (n *Node) monitorConnection(pid peer.ID) {
 
 			for _, c := range conns {
 				addr := c.RemoteMultiaddr().String()
+				// A Relay address looks like: /ip4/1.2.3.4/tcp/4001/p2p/QmRelay/p2p-circuit/p2p/QmPeer
 				isRelay := strings.Contains(addr, "circuit")
 
 				if !isRelay {
 					if !loggedDirect {
-						n.emitLog(fmt.Sprintf("DIRECT LINK ESTABLISHED! (%s)", addr))
+						n.emitLog(fmt.Sprintf("DIRECT LINK CONFIRMED! (%s)", addr))
 						n.emitStatus("HOLEPUNCH", "DIRECT")
 						loggedDirect = true
 					}
@@ -401,5 +457,48 @@ func (n *Node) monitorConnection(pid peer.ID) {
 				}
 			}
 		}
+	}
+}
+
+// Helper: Just updates the UI on how many peers we are connected to globally
+func (n *Node) reportSwarmSize() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.Ctx.Done():
+			return
+		case <-ticker.C:
+			count := len(n.Host.Network().Peers())
+			n.emitStatus("SWARM", fmt.Sprintf("%d", count))
+		}
+	}
+}
+
+func (n *Node) connectToBootnodes() {
+	var wg sync.WaitGroup
+	for _, addrStr := range dht.DefaultBootstrapPeers {
+		addr, err := multiaddr.NewMultiaddr(addrStr.String())
+		if err != nil {
+			continue
+		}
+		peerinfo, _ := peer.AddrInfoFromP2pAddr(addr)
+		wg.Add(1)
+		go func(pi *peer.AddrInfo) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(n.Ctx, 5*time.Second)
+			defer cancel()
+			n.Host.Connect(ctx, *pi)
+		}(peerinfo)
+	}
+	wg.Wait()
+}
+
+func (n *Node) waitForSwarm() {
+	for i := 0; i < 30; i++ {
+		if len(n.Host.Network().Peers()) > 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
