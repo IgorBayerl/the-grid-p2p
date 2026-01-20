@@ -3,9 +3,8 @@ package protocol
 import "github.com/libp2p/go-libp2p/core/peer"
 
 const (
-	ProtocolID     = "/the-grid/1.0.0"
-	DiscoveryTopic = "the-grid-discovery-v1"
-	GameProtocol   = "/the-grid/game/1.0.0"
+	ProtocolID   = "/the-grid/1.0.0"
+	GameProtocol = "/the-grid/game/1.0.0"
 
 	PacketInput = 0x01
 	PacketState = 0x02
@@ -13,7 +12,7 @@ const (
 	PacketPong  = 0x11
 )
 
-// --- Game Data ---
+// --- Game Structures ---
 
 type InputPacket struct {
 	DX int `json:"dx"`
@@ -30,21 +29,11 @@ type PlayerPosition struct {
 	C string `json:"c"`
 }
 
-// --- Ping Data ---
-
 type PingPayload struct {
-	OriginTime int64 `json:"t"` // UnixNano timestamp
+	OriginTime int64 `json:"t"`
 }
 
-// --- Discovery Data (Crucial for P2P) ---
-
-type DiscoveryPacket struct {
-	RoomCode string   `json:"room_code"`
-	PeerID   string   `json:"peer_id"`
-	Addrs    []string `json:"addrs"`
-}
-
-// --- Internal Messaging & Events ---
+// --- Internal Event Types ---
 
 type NetMessage struct {
 	Sender peer.ID `json:"-"`

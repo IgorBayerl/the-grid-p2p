@@ -1,5 +1,3 @@
-***
-
 # ⚡ The Grid P2P
 ### Serverless, Terminal-Based P2P Multiplayer Demonstrator
 
@@ -11,34 +9,76 @@ It combines **libp2p** (networking), **DHTs** (discovery), and **Bubble Tea** (U
 
 ## 📖 In Simple Terms: What is this?
 
-Most multiplayer games work like a conference call: everyone connects to a central server (the "host"), and that server passes messages around. If the server goes down, the game ends.
+Most multiplayer games work like a conference call: everyone connects to a central server, and that server passes messages around.
 
 **The Grid works like a Walkie-Talkie:**
-1.  **Discovery (The Phonebook):** We use the public IPFS network (DHT) to find other players using a "Room Code". We don't have a database of rooms; the network *is* the database.
-2.  **Connection (The Handshake):** Once we find a peer, we try to connect. Because most home routers block incoming connections (Firewalls/NAT), we use a technique called "Hole Punching" to trick the routers into letting us talk.
-3.  **The "Airlock" (The Guard):** The game refuses to start if the connection is slow (relayed). It forces a direct, high-speed link.
-4.  **The Game:** One player acts as the "Host" (authority) and the other as the "Client". They exchange movement data directly.
+1.  **Discovery (The Phonebook):** We use the public IPFS network to find other players. We don't have a database of rooms; the network *is* the database.
+2.  **The "Time-Slot" (Ghost Busting):** Unlike standard P2P apps where old "ghost" records linger for hours, The Grid uses **Time-Slotted Keys**. Room codes automatically rotate every 2 minutes. If you played 5 minutes ago, your record is mathematically invisible to new players.
+3.  **The "Airlock" (The Guard):** The game blocks gameplay until a **Direct Connection** (Hole Punch) is verified. It refuses to play over slow relays.
 
 ---
 
-## 🎯 What does this project test?
+## 🖥️ UI Walkthrough
 
-This is not just a game; it is a networking testbench. It validates three specific challenges:
+### 1. The Lobby (Entry)
+*The node connects to the global swarm (Bootstrapping). Once connected, you enter a shared code.*
 
-1.  **NAT Traversal (Hole Punching):** Can two computers on different private networks (e.g., Home WiFi vs. Phone Hotspot) talk directly without a middleman?
-2.  **Decentralized Discovery:** Can we find a specific peer out of thousands of nodes in the global swarm without a central server?
-3.  **State Synchronization:** Can we keep two terminals in sync using a Host-Authoritative model over a raw P2P stream?
+```text
+  THE GRID PROTOCOL
+
+  ENTER ROOM CODE:
+  > 808_
+
+  [ INFO ]
+  Connected to 742 Swarm Nodes.
+  Waiting for input...
+```
+
+### 2. The Airlock (Negotiation)
+*This is the critical phase. The app searches the DHT for the room code within the current 120-second time window.*
+
+```text
+  CONNECTION IN PROGRESS
+  Target: ROOM 808  |  Timeout: 114s
+  / Scanning Network...
+
+  > Discovery   [ FOUND ]      <-- Peer found in DHT
+  > Handshake   [ CONNECTED ]  <-- Connected via Relay
+  > Direct Link [ WORKING ]    <-- Attempting Hole Punch
+```
+
+### 3. The Game (Active)
+*A direct UDP/TCP link is established. Latency is calculated in real-time.*
+
+```text
+  THE GRID | HOST (Green @) | PING: 42 ms
+  ┌──────────────────────────────────────────────────┐
+  │ . . . . . . . . . . . . . . . . . . . . . . . . .│
+  │ . . @ . . . . . . . . . . . . . . . . . . . . . .│
+  │ . . . . . . . . . . . . . . . . . . . X . . . . .│
+  │ . . . . . . . . . . . . . . . . . . . . . . . . .│
+  └──────────────────────────────────────────────────┘
+  [ARROWS] Move  [Q] Quit to Lobby
+
+  [ GAME LOG ]
+  > Received Input DX:-1 DY:0
+```
 
 ---
 
 ## 🛠 Architecture & How It Works
 
 <details>
-<summary><strong>1. The "Serverless" Philosophy (Discovery)</strong> (Click to Expand)</summary>
+<summary><strong>1. Time-Slotted Discovery (Why divide by 120?)</strong> (Click to Expand)</summary>
 
-*   **No Database:** We do not store "Lobby IDs" anywhere.
-*   **DHT & GossipSub:** When you enter a Room Code (e.g., `829104`), the app hashes it to create a unique topic on the global IPFS Distributed Hash Table.
-*   **Bootstrapping:** On startup, your node connects to "Bootnodes" (public servers run by Protocol Labs). This takes 10-20 seconds. Once connected, you are part of the global swarm.
+In a Distributed Hash Table (DHT), records usually stay alive for 24 hours. This creates "Ghost Peers"—users who quit hours ago but still appear in search results.
+
+**The Solution:** We implement **Temporal Sharding**.
+*   We take the current Unix Timestamp and divide it by `120` (2 minutes).
+*   Room Code `808` becomes Topic `grid-lobby-808-14166666`.
+*   Every 120 seconds, the math result changes by +1, effectively creating a **new room**.
+*   When you search, the code looks for the `Current Window` and the `Previous Window` (to catch people who joined 10 seconds ago).
+*   **Result:** Old sessions are mathematically impossible to find.
 </details>
 
 <details>
@@ -51,94 +91,42 @@ This is the project's strict gatekeeper.
 </details>
 
 <details>
-<summary><strong>3. Game Sync & Topology</strong> (Click to Expand)</summary>
+<summary><strong>3. State Synchronization</strong> (Click to Expand)</summary>
 
-*   **Host-Authoritative:** To prevent cheating and de-sync, one peer is the "Boss".
-    *   The peer with the "lower" alphabetical Peer ID automatically becomes the Host.
-*   **The Loop:**
-    1.  **Client** presses arrow key -> Sends `PacketInput` (DX/DY).
-    2.  **Host** receives input -> Updates X/Y coordinates in memory.
-    3.  **Host** broadcasts `PacketState` (All Player Positions) to everyone.
-    4.  **Client** receives State -> Renders the screen.
-*   **Heartbeat:** A background loop pings every second. If the connection drops, the UI shows a "Broken Heart" icon.
+*   **Host-Authoritative:** To prevent cheating, one peer is the "Boss".
+*   The peer with the "lower" alphabetical Peer ID automatically becomes the Host.
+*   **Protocol:**
+    *   Client sends `InputPacket` (Key Presses).
+    *   Host updates logic.
+    *   Host broadcasts `StatePacket` (World Position).
 </details>
 
 ---
 
-## 🚀 How to Demo / Test (Step-by-Step)
+## 🚀 How to Demo / Test
 
-To see the magic happen, you need to simulate two distinct peers.
-
-### Scenario A: Localhost Testing (Logic Test)
-*Useful for testing game mechanics and UI flow.*
-
-1.  **Open Terminal 1 (Host-to-be):**
-    ```bash
-    go run main.go
-    ```
-2.  **Open Terminal 2 (Client-to-be):**
-    ```bash
-    go run main.go
-    ```
-3.  **Wait for Bootstrap:** Both terminals will show a loading bar. Wait until the text says `Global Swarm Uplink ..... [ OK ]`.
-4.  **Join Lobby:**
-    *   In Terminal 1, type a code (e.g., `123`) and press Enter.
-    *   In Terminal 2, type the **same** code (`123`) and press Enter.
-5.  **The Airlock:**
-    *   You will see `Negotiating...`.
-    *   Since this is localhost, the connection will instantly become `🟢 DIRECT LINK ESTABLISHED`.
-6.  **Play:**
-    *   Press `Enter` to start.
-    *   One window will say **HOST (Green @)**, the other **CLIENT (Red X)**.
-    *   Move around. Watch the lag (should be near zero).
-
-### Scenario B: The "Real" Test (NAT Traversal)
-*This tests the hole-punching capability. Requires two different devices.*
-
-**Prerequisites:**
-*   Computer A (e.g., on Home WiFi).
-*   Computer B (e.g., tethered to a Phone Hotspot / different WiFi).
+### Scenario: The "Real" Test (NAT Traversal)
+*Requires two different devices (e.g., Laptop on WiFi vs Laptop on Phone Hotspot).*
 
 1.  **Launch:** Run the application on both computers.
-2.  **Wait:** Allow the bootstrap to finish (approx 15-30s).
-3.  **Connect:** Enter the same Room Code on both.
-4.  **Observe the Airlock (The Critical Part):**
-    *   Initially, status will be `🟡 WAITING...` or `🟡 NEGOTIATING...`.
-    *   The logs will show `Relay Handshake`.
-    *   **Wait:** It might take 5-15 seconds for the "Hole Punch" to succeed.
-    *   **Success:** The status changes to `🟢 DIRECT LINK ESTABLISHED`.
-5.  **Fail Condition:** If it stays Yellow for >60 seconds, your router has a "Symmetric NAT" which is difficult to punch through without a TURN server (which we intentionally don't use).
-
----
-
-## 🕹 Controls & UI
-
-| Key                    | Action                         |
-|:-----------------------|:-------------------------------|
-| **Up/Down/Left/Right** | Move Character                 |
-| **Enter**              | Confirm Room Code / Start Game |
-| **Backspace**          | Delete Room Code character     |
-| **Q** or **Ctrl+C**    | Quit Application               |
-
-**UI Indicators:**
-*   ❤️ **Heart:** Connection is healthy (Direct P2P).
-*   💔 **Broken Heart:** Connection lost (Peer disconnected or timed out).
-*   **Log Window:** Shows raw packet events (Input Sent, State Received).
+2.  **Wait:** Allow the bootstrap to finish (Status: `[ OK ]`).
+3.  **Connect:** Enter the same Room Code (e.g., `555`) on both.
+4.  **Observe the Airlock:**
+    *   You will see the **Timeout Timer** counting down from 120s.
+    *   Wait for `Direct Link` to turn `[ DIRECT ]` (Green).
+5.  **Fail Condition:** If the timer hits `0s`, the session is scrubbed. Press Enter to try again.
 
 ---
 
 ## 🔧 Troubleshooting
 
-**1. "It's stuck on Searching..."**
-*   The IPFS DHT is vast. Sometimes it takes a moment to propagate the room topic.
-*   **Fix:** Restart both nodes. Ensure you wait for the "Global Swarm Uplink" to be `[ OK ]` *before* entering the lobby code.
+**1. "It timed out after 120 seconds"**
+*   This means the DHT propagation was too slow or the peers couldn't find each other.
+*   **Fix:** Ensure both players are entering the code at roughly the same time (within 1-2 minutes of each other). Just press Enter to retry.
 
-**2. "Peers connected, but game won't start"**
-*   Check the Airlock status. If it is not `DIRECT`, the game prevents starting to ensure quality.
-*   If you are on a corporate network or university WiFi, UDP hole punching might be blocked.
-
-**3. "Bad Packet" logs**
-*   This usually happens if an old version of the client tries to talk to a new version. Ensure both peers are running the exact same binary.
+**2. "Stuck on [ WAITING ] for Direct Link"**
+*   The peers found each other via Relay, but the Hole Punch failed.
+*   If this persists for >1 minute, one of the routers likely has **Symmetric NAT**, which is very hard to punch through without a TURN server (which we intentionally don't use to keep this serverless).
 
 ---
 
@@ -158,7 +146,7 @@ go mod tidy
 go run main.go
 ```
 
-Generate Build
+**Build:**
 ```bash
 go build -o game.exe main.go
 ```
